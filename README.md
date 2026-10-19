@@ -12,61 +12,39 @@
 面向 Linux / NVIDIA GPU 的轻量显存占用工具。  
 用环境变量选卡，用一个参数指定显存，其余策略集中在脚本开头。
 
-[安装](#安装) · [快速开始](#快速开始) · [抢卡策略](#抢卡策略) · [配置](#配置) · [测试](#测试)
+[快速开始](#快速开始) · [两种模式](#两种模式) · [抢卡策略](#抢卡策略) · [配置](#配置) · [测试](#测试)
 
 </div>
 
 ---
 
-## 两种模式
-
-| | 固定显存占用 | 渐进式抢卡 |
-| :--- | :--- | :--- |
-| **启动方式** | `llama --memory 30` | `llama` |
-| **选卡** | 单张 GPU | 一张或多张候选 GPU |
-| **显存行为** | 分配指定容量并保持 | 持续追加空余显存，条件满足后取得整卡 |
-| **计算行为** | 不执行计算循环 | 整卡取得后持续 FP16 矩阵计算 |
-| **结束方式** | Ctrl+C / `kill PID` | Ctrl+C / `kill PID` / 单卡释放 / 配置时限 |
-
-容量统一使用 **GiB**，1 GiB = 1024³ 字节。固定模式的指定容量是张量容量，进程实际显存还包含 CUDA 上下文等开销。
-
-## 安装
-
-需要 Linux、Python 3.9+、可正常工作的 NVIDIA 驱动与 `nvidia-smi`，以及当前 Python 环境中的 **CUDA 版 PyTorch**。实际 Python 版本还需满足所选 PyTorch 版本的要求。
-
-下载或克隆本仓库后，进入项目目录：
-
-```bash
-# 如果已经有可用的 CUDA PyTorch 环境，可直接使用该环境
-python3 -m pip install -r requirements.txt
-chmod +x llama
-
-# 检查驱动与当前 Python 环境
-nvidia-smi
-python3 -c 'import torch; print("CUDA available:", torch.cuda.is_available())'
-
-# 查看命令帮助，不分配 GPU 显存
-./llama --help
-```
-
-`requirements.txt` 只声明 `torch`，不会替你选择与驱动匹配的 CUDA 构建。如果检测结果是 `False`，请先根据 [PyTorch 安装说明](https://pytorch.org/get-started/locally/) 配置可用环境。
-
-<details>
-<summary><b>可选：安装为直接可用的 llama 命令</b></summary>
-
-在仓库目录运行：
-
-```bash
-mkdir -p "$HOME/.local/bin"
-ln -s "$PWD/llama" "$HOME/.local/bin/llama"
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-如需持久生效，将 `export PATH` 这一行加入 shell 配置。符号链接指向本仓库，移动仓库后需要更新链接。脚本使用当前 `PATH` 中的 `python3`，因此运行前应激活安装了 CUDA PyTorch 的环境。
-
-</details>
-
 ## 快速开始
+
+### 下载并安装
+
+需要 Linux、NVIDIA 驱动和 Python 3.9+。**已有 CUDA 版 PyTorch 环境时，先激活该环境即可，无需重复安装依赖。**
+
+```bash
+git clone https://github.com/HaiFengLoveStudy/llama.git
+cd llama
+chmod +x llama
+```
+
+没有安装 PyTorch 时，再运行：
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+运行 `python3 -c 'import torch; print(torch.cuda.is_available())'`，输出 `True` 即可使用。如果输出 `False`，请按 [PyTorch 安装说明](https://pytorch.org/get-started/locally/) 安装与驱动兼容的 CUDA 版本。
+
+### 在 0 号卡上运行
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./llama
+```
+
+默认逐步占用空闲显存，取得整卡后持续计算；按 **Ctrl+C** 停止并释放显存。更多用法如下。
 
 ### ① 固定占用 30 GiB
 
@@ -129,6 +107,33 @@ kill 12345
 ```
 
 主控请求自己的工作进程退出；超时后仅终止自身工作进程，释放它们持有的显存。
+
+## 两种模式
+
+| | 固定显存占用 | 渐进式抢卡 |
+| :--- | :--- | :--- |
+| **启动方式** | `llama --memory 30` | `llama` |
+| **选卡** | 单张 GPU | 一张或多张候选 GPU |
+| **显存行为** | 分配指定容量并保持 | 持续追加空余显存，条件满足后取得整卡 |
+| **计算行为** | 不执行计算循环 | 整卡取得后持续 FP16 矩阵计算 |
+| **结束方式** | Ctrl+C / `kill PID` | Ctrl+C / `kill PID` / 单卡释放 / 配置时限 |
+
+容量统一使用 **GiB**，1 GiB = 1024³ 字节。固定模式的指定容量是张量容量，进程实际显存还包含 CUDA 上下文等开销。
+
+<details>
+<summary><b>可选：安装为直接可用的 llama 命令</b></summary>
+
+在仓库目录运行：
+
+```bash
+mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/llama" "$HOME/.local/bin/llama"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+如需持久生效，将 `export PATH` 这一行加入 shell 配置。符号链接指向本仓库，移动仓库后需要更新链接。脚本使用当前 `PATH` 中的 `python3`，因此运行前应激活安装了 CUDA PyTorch 的环境。
+
+</details>
 
 ## 抢卡策略
 

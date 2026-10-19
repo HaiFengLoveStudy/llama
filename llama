@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""llama：默认逐步抢卡；--memory GiB 固定占用；--release GPU --pid PID 单卡释放。"""
+
+# ================= 主要参数（容量统一使用 GiB） =================
+CLAIM_MODE = "any"         # any：取得一张后释放其他卡；all：取得全部指定卡
+POLL_SECONDS = 0.5           # 查询显存、进程列表的间隔（秒）
+FREE_THRESHOLD_GIB = 10.0    # 可用显存达到此值时，允许追加分配
+ALLOCATION_STEP_GIB = 9.5    # 每次追加占用量
+EXCLUSIVE_SAMPLES = 1       # 连续多少轮没有其他计算进程，才尝试取得整卡
+RESERVE_GIB = 1.0           # 整卡阶段至少保留的空余显存；不用于增量占用阈值
+COMPUTE_HOURS = None        # None：直到手动停止；正数：每张卡计算小时数
+MATRIX_SIZE = 8192          # FP16 矩阵大小，循环矩阵乘法提高计算利用率
+BLOCK_MIB = 256             # 分块分配，避免要求单个巨大连续内存块
+RETRY_SECONDS = 5.0        # 分配失败后冷却时间
+STARTUP_TIMEOUT = 180.0    # 工作进程启动或命令无回应的超时（秒）
+STATUS_LOG_SECONDS = 30.0  # 等待阶段每张卡的状态日志间隔（秒）
+COMPUTE_LOG_SECONDS = 60.0 # 计算阶段心跳日志间隔（秒），包含显存及剩余时间
+STOP_TIMEOUT = 15.0        # 正常停止超时后，终止本程序的工作进程
+# ==============================================================
+
+import argparse
+import csv
+import fcntl
+import io
+import multiprocessing as mp
+import math
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import time
+import threading
+
+GIB = 1024**3
+
+
+def log(message):
+    print(time.strftime('%F %T') + ' ' + message, flush=True)
+
+
+def query(fields, kind='gpu'):
+    result = subprocess.run(['nvidia-smi', f'--query-{kind}={fields}',
+                             '--format=csv,noheader,nounits'],
+                            capture_output=True, text=True, check=True, timeout=10)
+    return list(csv.reader(io.StringIO(result.stdout), skipinitialspace=True))
+
+
+def snapshot():
+    gpu_rows = query('index,uuid,memory.total,memory.used,memory.free')
+    process_rows = query('gpu_uuid,pid', 'compute-apps')
+    pids = {}
+    for uuid, pid in process_rows:
+        pids.setdefault(uuid, set()).add(int(pid))
+    return [dict(index=row[0], uuid=row[1], total=float(row[2])/1024,
+                 used=float(row[3])/1024, free=float(row[4])/1024,
+                 pids=pids.get(row[1], set())) for row in gpu_rows]
+
+
+def worker(uuid, pipe):
+    os.environ['CUDA_VISIBLE_DEVICES'] = uuid
+    parent_pid = os.getppid()
+    stopping = False
+
+    def stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    blocks = []
+    torch = None
+    matrices = None
+    deadline = None
+    computing = False
+    next_heartbeat = 0.0
+    try:
+        import torch
+        pipe.send(('online', os.getpid()))
+        while not stopping and os.getppid() == parent_pid:
+            if deadline is not None and time.monotonic() >= deadline:
+                pipe.send(('finished', f'{COMPUTE_HOURS:g} 小时计算期限已到'))
+                break
+            if pipe.poll(0 if computing else 0.2):
+                command = pipe.recv()
+                if command == 'stop':
+                    break
+                before = len(blocks)
+                try:
+                    if command == 'grow':
+                        free, _ = torch.cuda.mem_get_info(0)
+                        if free < int(FREE_THRESHOLD_GIB * GIB):
+                            pipe.send(('grown', f'重新检查空余={free/GIB:.2f} GiB，低于 {FREE_THRESHOLD_GIB:g} GiB，跳过'))
+                            continue
+                        log(f'[追加开始] GPU={uuid} PID={os.getpid()} 空余={free/GIB:.2f} GiB，申请={ALLOCATION_STEP_GIB:g} GiB')
+                        remaining = int(ALLOCATION_STEP_GIB * GIB)
+                    elif command == 'claim':
+                        current = next(g for g in snapshot() if g['uuid'] == uuid)
+                        if current['pids'] - {os.getpid()}:
+                            raise RuntimeError('整卡分配前发现其他计算进程，继续等待')
+                        # 增量占用可能几乎填满显存，先从自身持有量中腾出预热空间。
+                        needed = 6 * MATRIX_SIZE**2 + int(RESERVE_GIB * GIB)
+                        while blocks and torch.cuda.mem_get_info(0)[0] < needed:
+                            blocks.pop()
+                            torch.cuda.empty_cache()
+                        before = len(blocks)
+                        log(f'[整卡准备] GPU={uuid} PID={os.getpid()} 开始创建计算张量并预热')
+                        # 先建立计算张量并预热，给 CUDA/cuBLAS 工作区留出真实空间。
+                        matrices = []
+                        matrices.append(torch.randn((MATRIX_SIZE, MATRIX_SIZE), device='cuda', dtype=torch.float16))
+                        matrices.append(torch.randn_like(matrices[0]))
+                        matrices.append(torch.empty_like(matrices[0]))
+                        for _ in range(3):
+                            torch.mm(matrices[0], matrices[1], out=matrices[2])
+                        torch.cuda.synchronize()
+                        free, total = torch.cuda.mem_get_info(0)
+                        target = max(0, total - int(RESERVE_GIB * GIB))
+                        remaining = max(0, min(target - (total - free), free - int(RESERVE_GIB * GIB)))
+                        log(f'[整卡分配] GPU={uuid} PID={os.getpid()} 已用={(total-free)/GIB:.2f} GiB，目标={target/GIB:.2f} GiB，追加={remaining/GIB:.2f} GiB')
+                    else:
+                        raise RuntimeError(f'未知命令 {command}')
+                    while remaining > 0 and not stopping and os.getppid() == parent_pid:
+                        size = min(remaining, BLOCK_MIB * 1024**2)
+                        blocks.append(torch.empty(size, dtype=torch.uint8, device='cuda'))
+                        remaining -= size
+                    if stopping or os.getppid() != parent_pid:
+                        break
+                    torch.cuda.synchronize()
+                    if command == 'claim':
+                        torch.mm(matrices[0], matrices[1], out=matrices[2])
+                        torch.cuda.synchronize()
+                        current = next(g for g in snapshot() if g['uuid'] == uuid)
+                        if current['pids'] - {os.getpid()}:
+                            raise RuntimeError('计算启动后发现其他计算进程，取消本次整卡分配')
+                        deadline = None if COMPUTE_HOURS is None else time.monotonic() + COMPUTE_HOURS * 3600
+                        computing = True
+                        free, total = torch.cuda.mem_get_info(0)
+                        pipe.send(('ready', dict(pid=os.getpid(), used_gib=(total-free)/GIB,
+                                                 end=None if COMPUTE_HOURS is None else time.time()+COMPUTE_HOURS*3600)))
+                    else:
+                        free, _ = torch.cuda.mem_get_info(0)
+                        pipe.send(('grown', f'追加成功，本进程张量累计={sum(x.numel() for x in blocks)/GIB:.2f} GiB，当前空余={free/GIB:.2f} GiB'))
+                except Exception as exc:
+                    # 回滚本次追加，不放弃此前已经持有的显存。
+                    del blocks[before:]
+                    matrices = None
+                    torch.cuda.empty_cache()
+                    pipe.send(('retry', f'{exc}；本次追加已回滚，保留张量={sum(x.numel() for x in blocks)/GIB:.2f} GiB，{RETRY_SECONDS:g} 秒后重试'))
+            if computing and not stopping:
+                torch.mm(matrices[0], matrices[1], out=matrices[2])
+                torch.cuda.synchronize()
+                if time.monotonic() >= next_heartbeat:
+                    free, total = torch.cuda.mem_get_info(0)
+                    log(f'[计算运行中] GPU={uuid} PID={os.getpid()} 整卡已用={(total-free)/GIB:.2f} GiB，'
+                        f'本进程张量={torch.cuda.memory_allocated(0)/GIB:.2f} GiB，空余={free/GIB:.2f} GiB，'
+                        f'剩余={"不限时" if deadline is None else format(max(0, deadline-time.monotonic())/3600, ".2f") + " 小时"}')
+                    next_heartbeat = time.monotonic() + COMPUTE_LOG_SECONDS
+    except Exception as exc:
+        try:
+            pipe.send(('fatal', str(exc)))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        matrices = None
+        blocks.clear()
+        if torch is not None and torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
+        log(f'[工作进程退出] GPU={uuid} PID={os.getpid()}，已清理自身显存')
+        pipe.close()
+
+
+def stop_worker(state):
+    process = state['process']
+    log(f"[停止] GPU {state['index']} PID={process.pid}，请求退出")
+    if process.is_alive():
+        try:
+            state['pipe'].send('stop')
+        except (OSError, EOFError):
+            pass
+        process.join(STOP_TIMEOUT)
+    if process.is_alive():
+        log(f'[停止超时] PID={process.pid}，发送 SIGTERM')
+        process.terminate()
+        process.join(5)
+    if process.is_alive():
+        log(f'[强制停止] PID={process.pid}，发送 SIGKILL')
+        process.kill()
+        process.join()
+    state['pipe'].close()
+    log(f"[已停止] GPU {state['index']} PID={process.pid} exitcode={process.exitcode}")
+
+
+def control_path(pid):
+    return Path.home() / '.cache' / 'gpu_hold' / f'control-{pid}.sock'
+
+
+def release_gpu(pid, index):
+    """请求正在运行的主控移除一张卡；其他卡继续运行。"""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(STOP_TIMEOUT + 45)
+        client.connect(str(control_path(pid)))
+        client.sendall((index + '\n').encode())
+        with client.makefile('rb') as response:
+            message = response.readline(4096).decode().strip()
+        if not message.startswith('OK '):
+            raise RuntimeError(message or '主控未返回释放结果')
+        log(message)
+    return 0
+
+
+def handle_release(listener, states, locks, candidate, winner):
+    try:
+        client, _ = listener.accept()
+    except BlockingIOError:
+        return candidate, winner
+    with client:
+        client.settimeout(2)
+        try:
+            with client.makefile('rb') as request:
+                index = request.readline(128).decode().strip()
+            uuid = next((u for u, state in states.items() if state['index'] == index), None)
+            if uuid is None:
+                reply = f'ERROR GPU {index} 不在本实例的监测列表中'
+            else:
+                log(f'[单卡释放请求] GPU {index}，将停止占用且不再监测此卡')
+                stop_worker(states[uuid])
+                del states[uuid]
+                locks.pop(uuid).close()
+                if candidate == uuid:
+                    candidate = None
+                if winner == uuid:
+                    winner = None
+                reply = f'OK GPU {index} 已释放；其余 GPU {[s["index"] for s in states.values()]} 继续运行'
+                log(reply)
+            client.sendall((reply + '\n').encode())
+        except (OSError, UnicodeError) as exc:
+            log(f'[控制连接异常] {exc}')
+    return candidate, winner
+
+
+def memory_size(value):
+    size = float(value)
+    if not math.isfinite(size) or size <= 0 or int(size * GIB) < 1:
+        raise argparse.ArgumentTypeError('显存大小必须是有限正数（GiB），且不少于 1 字节')
+    return size
+
+
+def hold_memory(memory_gib, selected):
+    requested = int(memory_gib * GIB)
+    stopped = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda signum, frame: stopped.set())
+
+    try:
+        import torch
+    except ImportError:
+        print('错误：当前 Python 环境未安装 PyTorch，请先激活有 CUDA 版 PyTorch 的环境。', file=sys.stderr)
+        return 1
+    if not torch.cuda.is_available():
+        print('错误：指定的显卡不可用，或当前 PyTorch 不支持 CUDA。', file=sys.stderr)
+        return 1
+
+    blocks = []
+    try:
+        free, _ = torch.cuda.mem_get_info(0)
+        if requested > free:
+            raise RuntimeError(f'请求 {memory_gib:g} GiB，当前仅剩 {free / 1024**3:.2f} GiB')
+        remaining = requested
+        while remaining and not stopped.is_set():
+            size = min(remaining, BLOCK_MIB * 1024**2)
+            blocks.append(torch.empty(size, dtype=torch.uint8, device='cuda:0'))
+            remaining -= size
+        if not stopped.is_set():
+            print(f'PID={os.getpid()} | CUDA_VISIBLE_DEVICES={selected} | '
+                  f'GPU={torch.cuda.get_device_name(0)} | 已分配={memory_gib:g} GiB', flush=True)
+            print('仅保持显存，不运行计算循环。停止命令：kill ' + str(os.getpid()), flush=True)
+            stopped.wait()
+    except Exception as exc:
+        print(f'显存分配失败：{exc}', file=sys.stderr, flush=True)
+        return 1
+    finally:
+        blocks.clear()
+        torch.cuda.empty_cache()
+        print('已释放本脚本的显存。', flush=True)
+    return 0
+
+
+
+def validate_config():
+    positive = (POLL_SECONDS, FREE_THRESHOLD_GIB, ALLOCATION_STEP_GIB, RESERVE_GIB,
+                RETRY_SECONDS, STARTUP_TIMEOUT, STATUS_LOG_SECONDS, COMPUTE_LOG_SECONDS, STOP_TIMEOUT)
+    integers = (EXCLUSIVE_SAMPLES, MATRIX_SIZE, BLOCK_MIB)
+    if (CLAIM_MODE not in ('any', 'all')
+            or any(not isinstance(x, (int, float)) or not math.isfinite(x) or x <= 0 for x in positive)
+            or any(not isinstance(x, int) or isinstance(x, bool) or x <= 0 for x in integers)
+            or ALLOCATION_STEP_GIB > FREE_THRESHOLD_GIB
+            or (COMPUTE_HOURS is not None and (not isinstance(COMPUTE_HOURS, (int, float))
+                or not math.isfinite(COMPUTE_HOURS) or COMPUTE_HOURS <= 0))):
+        raise ValueError('代码开头常量不合法，请检查策略、容量、时长和整数参数')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--memory', type=memory_size, metavar='GiB',
+                        help='单卡固定占用指定 GiB 显存，支持小数；只保持显存直到手动停止，需指定 CUDA_VISIBLE_DEVICES')
+    parser.add_argument('--release', metavar='GPU', help='释放物理 GPU 编号，并停止监测此卡')
+    parser.add_argument('--pid', type=int, help='接收释放命令的主控 PID')
+    args = parser.parse_args()
+    if args.release is not None or args.pid is not None:
+        if (args.memory is not None or args.release is None or args.pid is None
+                or args.pid <= 0 or not args.release.isdecimal()):
+            parser.error('请使用 --release 物理GPU编号 --pid 主控PID；不能同时使用 --memory')
+        return release_gpu(args.pid, str(int(args.release)))
+    validate_config()
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+    if not visible.strip():
+        parser.error('请设置 CUDA_VISIBLE_DEVICES，例如 CUDA_VISIBLE_DEVICES=0,1')
+    tokens = [x.strip() for x in visible.split(',')]
+    if any(not x or not (x.isdecimal() or x.startswith('GPU-')) for x in tokens):
+        parser.error('CUDA_VISIBLE_DEVICES 必须是物理编号或完整 GPU UUID 列表')
+    if args.memory is not None and len(tokens) != 1:
+        parser.error('--memory 模式必须指定一张 GPU')
+    available = snapshot()
+    initial = [g for g in available if g['index'] in tokens or g['uuid'] in tokens]
+    known = {key for g in initial for key in (g['index'], g['uuid'])}
+    if any(token not in known for token in tokens):
+        parser.error('指定的 GPU 不存在；请使用物理编号或完整 UUID，不支持 MIG')
+    if args.memory is not None:
+        selected = initial[0]['uuid']
+        os.environ['CUDA_VISIBLE_DEVICES'] = selected
+        return hold_memory(args.memory, selected)
+    for g in initial:
+        log(f"GPU {g['index']} {g['uuid']} 空余={g['free']:.2f} GiB 已用={g['used']:.2f} GiB 计算PID={sorted(g['pids'])}")
+    log(f'[启动配置] 策略={CLAIM_MODE}；轮询={POLL_SECONDS:g}s；追加={ALLOCATION_STEP_GIB:g} GiB；'
+        f'整卡确认={EXCLUSIVE_SAMPLES} 次；预留={RESERVE_GIB:g} GiB；计算小时数={COMPUTE_HOURS}')
+    context = mp.get_context('spawn')
+    states = {}
+    locks = {}
+    listener = None
+    endpoint = control_path(os.getpid())
+    candidate = winner = None
+    directory = Path.home() / '.cache' / 'gpu_hold'
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        for g in initial:
+            lock = (directory / (g['uuid'] + '.lock')).open('a')
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock.close()
+                raise RuntimeError(f"GPU {g['index']} 已被同一用户的另一个 llama 实例监测")
+            locks[g['uuid']] = lock
+        for g in initial:
+            parent, child = context.Pipe()
+            process = context.Process(target=worker, args=(g['uuid'], child), daemon=True)
+            process.start()
+            child.close()
+            states[g['uuid']] = dict(process=process, pipe=parent, status='starting',
+                                     since=time.monotonic(), retry=0, streak=0, index=g['index'], last_log=0)
+            log(f"[工作进程启动] GPU {g['index']} UUID={g['uuid']} PID={process.pid}")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(endpoint))
+        os.chmod(endpoint, 0o600)
+        listener.listen(4)
+        listener.setblocking(False)
+        log(f'主控 PID={os.getpid()}；停止整个任务：kill {os.getpid()}')
+        log(f'单独释放某卡：./llama --release GPU编号 --pid {os.getpid()}')
+        while True:
+            candidate, winner = handle_release(listener, states, locks, candidate, winner)
+            if not states:
+                log('[退出] 所有受控卡均已释放')
+                return 0
+            for uuid, state in list(states.items()):
+                if state['pipe'].poll():
+                    try:
+                        event, detail = state['pipe'].recv()
+                    except EOFError:
+                        raise RuntimeError(f"GPU {state['index']} 工作进程连接断开")
+                    label = {'online': '工作进程就绪', 'grown': '追加结果', 'ready': '整卡计算启动成功',
+                             'retry': '分配失败/等待重试', 'fatal': '工作进程异常', 'finished': '计算结束'}.get(event, event)
+                    log(f"[{label}] GPU {state['index']} PID={state['process'].pid}: {detail}")
+                    if event == 'fatal':
+                        raise RuntimeError(str(detail))
+                    if event == 'finished':
+                        stop_worker(states.pop(uuid))
+                        locks.pop(uuid).close()
+                        if winner == uuid:
+                            winner = None
+                        continue
+                    if event == 'ready':
+                        candidate = None
+                        state['status'] = 'computing'
+                        if CLAIM_MODE == 'any':
+                            winner = uuid
+                            for other in list(states):
+                                if other != winner:
+                                    stop_worker(states.pop(other))
+                                    locks.pop(other).close()
+                        log(f"[整卡已取得] GPU {state['index']}；策略={CLAIM_MODE}；持续矩阵计算")
+                        if CLAIM_MODE == 'any':
+                            break
+                        continue
+                    state['status'] = 'idle'
+                    if event == 'retry':
+                        state['retry'] = time.monotonic() + RETRY_SECONDS
+                        state['streak'] = 0
+                        if candidate == uuid:
+                            candidate = None
+                if not state['process'].is_alive():
+                    raise RuntimeError(f"GPU {state['index']} 工作进程退出，停止整个任务")
+                if state['status'] in ('starting', 'grow', 'claim') and time.monotonic()-state['since'] > STARTUP_TIMEOUT:
+                    raise RuntimeError(f"GPU {state['index']} 工作进程回应超时")
+            if winner is not None:
+                time.sleep(POLL_SECONDS)
+                continue
+            try:
+                current = {g['uuid']: g for g in snapshot()}
+            except (subprocess.SubprocessError, ValueError, OSError) as exc:
+                for state in states.values():
+                    state['streak'] = 0
+                log(f'查询失败，本轮不追加：{exc}')
+                time.sleep(POLL_SECONDS)
+                continue
+            for uuid, state in states.items():
+                if state['status'] == 'computing':
+                    continue
+                g = current.get(uuid)
+                if g is None:
+                    raise RuntimeError(f'设备消失：{uuid}')
+                foreign = g['pids'] - {state['process'].pid}
+                previous_streak = state['streak']
+                state['streak'] = min(state['streak']+1, EXCLUSIVE_SAMPLES) if not foreign else 0
+                if state['streak'] != previous_streak:
+                    log(f"[整卡确认] GPU {state['index']} 连续无其他计算进程={state['streak']}/{EXCLUSIVE_SAMPLES}，其他PID={sorted(foreign)}")
+                if time.monotonic() - state['last_log'] >= STATUS_LOG_SECONDS:
+                    if state['status'] != 'idle':
+                        reason = {'starting': '工作进程启动中', 'grow': '追加分配中', 'claim': '整卡准备中'}.get(state['status'], state['status'])
+                    elif time.monotonic() < state['retry']:
+                        reason = '分配失败后的冷却期'
+                    elif CLAIM_MODE == 'any' and candidate is not None:
+                        reason = '等待候选卡完成整卡准备'
+                    elif g['free'] < FREE_THRESHOLD_GIB:
+                        reason = '空余显存未达到追加阈值'
+                    else:
+                        reason = '检查完成，准备分配'
+                    log(f"[轮询状态] GPU {state['index']} PID={state['process'].pid} 已用={g['used']:.2f}/{g['total']:.2f} GiB，"
+                        f"空余={g['free']:.2f} GiB，其他PID={sorted(foreign)}，状态={reason}")
+                    state['last_log'] = time.monotonic()
+                if state['status'] != 'idle' or time.monotonic() < state['retry']:
+                    continue
+                command = None
+                can_claim = CLAIM_MODE == 'all' or candidate is None
+                if can_claim and state['streak'] >= EXCLUSIVE_SAMPLES:
+                    if CLAIM_MODE == 'any':
+                        candidate = uuid
+                    command = 'claim'
+                elif can_claim and g['free'] >= FREE_THRESHOLD_GIB:
+                    command = 'grow'
+                if command:
+                    action = '尝试取得整卡并启动计算' if command == 'claim' else f'追加 {ALLOCATION_STEP_GIB:g} GiB'
+                    log(f"[下发任务] GPU {state['index']} PID={state['process'].pid} 空余={g['free']:.2f} GiB，{action}")
+                    state['pipe'].send(command)
+                    state['status'] = command
+                    state['since'] = time.monotonic()
+            time.sleep(POLL_SECONDS)
+    finally:
+        for state in states.values():
+            stop_worker(state)
+        for lock in locks.values():
+            lock.close()
+        if listener is not None:
+            listener.close()
+            endpoint.unlink(missing_ok=True)
+        log('本程序工作进程已清理，显存已释放。')
+
+
+if __name__ == '__main__':
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        log('[退出] 收到终止请求')
+        sys.exit(130)
+    except Exception as exc:
+        log(f'错误：{exc}')
+        sys.exit(1)
